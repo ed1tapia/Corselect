@@ -1,0 +1,634 @@
+---
+title: "Métodos de selección de variables."
+format: html
+editor: visual
+author: 
+  - Michel Alejandro Altamirano Paredes
+  - Edwin Tapia Salim
+---
+
+```{r Librerías necesarias, include=FALSE}
+# Cargamos las librerias necesarias
+library(glmnet)
+library(knitr)
+library(caret)
+library(car)
+library(MASS)
+library(lmtest)
+library(ggcorrplot)
+```
+
+## Introducción
+
+Este escrito tiene por objeto mostrar las diferencias en la precisión entre distintos métodos de selección de variables. Para ello, dichos métodos serán sometidos a distintas pruebas, desde simples repeticiones de los experimentos hasta variaciones en los tamaños de muestra, covariables y en los supuestos de heterocedasticidad, homocedasticidad, colinealidad y autocorrelacón.
+
+Los métodos estudiados fueron:
+
+- Lasso
+- Elastic Net
+- Stepwise
+- Corr Select (Que será discutido más adelante)
+
+## Metodología
+
+Para asegurar una correcta reproducibilidad de este escrito, se siguieron los siguientes puntos:
+
+1. **Fijación de la semilla**. En los casos 2 y 3 se fijó la semilla `123` para asegurar su reproducibilidad.
+2. **Paqueterías utilizadas**. Las paqueterías utilizadas para este escrito fueron:
+
+    - glmnet
+    - caret
+    - car
+    - MAAS
+    - lmtest
+    
+3. **True Model**. El modelo verdadero bajo el que se hizo la medición de precisión de cada método fue el siguiente:
+
+$$y = 18*\beta_1 + 24*\beta_{10} + 20*\beta_{20} + \epsilon$$
+
+Notando que las variables que nos interesan son: $\beta_1, \beta_{10}$ y $\beta_{20}$.
+
+4. **Cross Validation**. Se empleó el algoritmo K - Cross Validation para afinar el valor del hiperparámetro $\lambda$ en los modelos de *Lasso* y *Elastic Net*.
+
+5. **Modelo de selección**. En cada método de selección de variables se ajustaron modelos lienales generalizados con distribución normal y función liga identidad.
+
+Nótese que estos modelos también son llamados *regresiones lineales simples*
+
+6. **Nomenclatura**. Las variables utilizadas para llevar a cabo los experimentos fueron las siguientes:
+
+    - R: Número de repeticiones del método
+    - k: Número de variables de la muestra
+    - N: Número de observaciones de la muestra
+    - X: Conjunto de datos simulados
+    - y: Variable de respuesta construida con base en los coeficientes utilizados en el  **True Model**
+
+Con todo esto en mente, veamos los casos de estudio.
+
+## 1) Múltiples repeticiones
+
+En este caso se utilizaron los siguientes parámetros para poner a prueba a los distintos métodos:
+
+```{r Variables caso 1}
+R <- 10
+k <- 30
+N <- 500
+```
+
+Además, cabe mencionar que los resultados de todos los procedimientos aparecen al final de este apartado en una única tabla para que sean más fácilmente comparables.
+
+### a) Lasso
+
+Para este método y para el de Elastic Net se decidió crear una función auxiliar que nos arrojara los coeficientes distintos de cero de los modelos. Dicha función hace uso de la lambda ajustada mínima y es la siguiente:
+
+```{r Función coeficientes cero}
+# Creamos una función para obtener los coeficientes
+get_nonzero_coefs <- function(model, EN = FALSE) {
+  if (EN == FALSE){
+    coefs <- as.matrix(coef(model, s = "lambda.min"))
+  } else {
+    coefs <- as.matrix(coef(model$finalModel, model$bestTune$lambda))
+  }
+  # Seleccionamos los coeficientes distintos de cero, excluyendo el intercepto
+  nonzero <- coefs[coefs != 0, , drop = FALSE]
+  rownames(nonzero)[rownames(nonzero) != "(Intercept)"]
+}
+```
+
+```{r Método Lasso, include=FALSE}
+# Creamos variables de conteo
+contadorX1_L <- 0
+contadorX10_L <- 0
+contadorX20_L <- 0
+
+# Ejecutamos el proceso de selección Lasso
+for (i in seq_len(R)){
+  # Creamos los datos de prueba
+  X <- matrix(rnorm(N * k), nrow = N, ncol = k)
+  colnames(X) <- paste0("X", 1:k) # Asignamos nombres a nuestras columnas
+  y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+
+  # Afinamos el valor de lambda
+  mod <-  cv.glmnet(X, 
+                    y, 
+                    nfolds = 10, 
+                    type.measure = "mse", 
+                    gamma = 0, 
+                    relax = FALSE, 
+                    family = gaussian("identity"))
+
+  # Obtenemos los coeficientes del modelo con lambda minima y los comparamos con los que deberían ser del true model
+  coeficientes <- get_nonzero_coefs(mod)
+  if ("X1" %in% coeficientes){
+    contadorX1_L <- contadorX1_L + 1
+  }
+  if ("X10" %in% coeficientes){
+    contadorX10_L <- contadorX10_L + 1
+  }
+  if ("X20" %in% coeficientes){
+    contadorX20_L <- contadorX20_L + 1
+  }
+}
+conteo_lasso <- c(contadorX1_L, contadorX10_L, contadorX20_L)
+```
+
+### b) Elastic Net
+
+Como sabemos, la principal diferencia entre Ridge, Lasso y Elastic Net radica en el valor que le asignemos a $\alpha$. Mientras que en los dos primeros este valor es fijo, en Elastic Net este se convierte en un hiperparámetro más, por tanto, hemos de afinarlo.
+
+Para ello haremos uso de la función `trainControl()` del paquete `caret` donde iremos probando distintos valores tanto de $\alpha$ como de $\lambda$ para, después, medir su poder predictivo haciendo uso de la raíz del error cuadrático medio (*RMSE* por sus siglas en inglés).
+
+Además, es importante aclarar que el método de afinación fue el tradicional *grid search*, que parte de una filosofía de fuerza bruta pues prueba todas las posibles combinaciones de los parámetros dadas en unas mallas de valores para cada uno, determinando así cual de estas combinaciones resulta ser mejor.
+
+```{r Método Elastic Net, include=FALSE}
+# Creamos variables de conteo
+contadorX1_EN <- 0
+contadorX10_EN <- 0
+contadorX20_EN <- 0
+
+# Ejecutamos el proceso de selección Elastic Net
+for (i in seq_len(R)){
+  # Creamos los datos de prueba
+  X <- matrix(rnorm(N * k), nrow = N, ncol = k)
+  colnames(X) <- paste0("X", 1:k) # Asignamos nombres a nuestras columnas
+  y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+  
+  # Seleccionamos el método de remuestreo
+  Ajuste <- trainControl(method = "cv", 
+                         number = 5)
+  
+  # Creamos una malla para afinar a alpha y a lambda
+  tuneGrid <- expand.grid(alpha = seq(0, 1, by = 0.05), 
+                          lambda = 10^seq(-3, 0, length = 50))
+  
+  # Ajustamos el modelo y obtenemos las hiperparámetros afinados al mismo tiempo
+  model <- caret::train(
+    x = X, y = y,
+    method = "glmnet",
+    trControl = Ajuste,
+    metric = "RMSE",
+    tuneGrid = tuneGrid
+  )
+  
+  # Obtenemos los coeficientes del modelo con los mejores hiperparámetros y los comparamos con los que deberían ser del true model
+  coeficientes <- get_nonzero_coefs(model, EN = TRUE)
+  if ("X1" %in% coeficientes){
+    contadorX1_EN <- contadorX1_EN + 1
+  }
+  if ("X10" %in% coeficientes){
+    contadorX10_EN <- contadorX10_EN + 1
+  }
+  if ("X20" %in% coeficientes){
+    contadorX20_EN <- contadorX20_EN + 1
+  }
+}
+conteo_EN <- c(contadorX1_EN, contadorX10_EN, contadorX20_EN)
+```
+
+### c) Stepwise
+
+En este caso realizamos una selección de variables mediante el método stepwise utilizando los criterios de información más comunes: el criterio de información de Akaike (AIC) y el criterio de información bayesiano (BIC).
+
+Además, para tener una completa rigurosidad en el experimento decidimos realizar una selección de variables mediante el método *both*.
+
+#### Stepwise AIC
+
+```{r Método Step AIC, include=FALSE}
+# Creamos variables de conteo
+contadorX1_SA <- 0
+contadorX10_SA <- 0
+contadorX20_SA <- 0
+
+# Ejecutamos el proceso de selección Stepwise AIC
+for (i in seq_len(R)) {
+  # Creamos los datos de prueba
+  X <- data.frame(matrix(rnorm(N * k), nrow = N, ncol = k))
+  X$y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+  
+  # Ajustamos un modelo auxiliar
+  modAux <- lm(y ~ ., data = X)
+  
+  # Realizamos la selección mediante stepwise AIC
+  mod <- stepAIC(modAux, 
+                 scope = list(lower = ~ 1, upper = y ~ .),
+                 trace = FALSE, 
+                 direction = "both")
+  
+  # Obtenemos los coeficientes del modelo y los comparamos con los que deberían ser del true model
+  coeficientes <- names(coef(mod))
+  if ("X1" %in% coeficientes){
+    contadorX1_SA <- contadorX1_SA + 1
+  }
+  if ("X10" %in% coeficientes){
+    contadorX10_SA <- contadorX10_SA + 1
+  }
+  if ("X20" %in% coeficientes){
+    contadorX20_SA <- contadorX20_SA + 1
+  }
+}
+conteo_SA <- c(contadorX1_SA, contadorX10_SA, contadorX20_SA)
+```
+
+#### Stepwise BIC
+
+```{r Método Step BIC, include=FALSE}
+# Creamos variables de conteo
+contadorX1_SB <- 0
+contadorX10_SB <- 0
+contadorX20_SB <- 0
+
+# Creamos la penalización para que se utilice el criterio BIC
+pen <- log(N) # Aquí se calcula el logaritmo de la cantidad de filas. Podría haberse incluido en el ciclo for como log(nrow(X)), sin embargo se hizo fuera de este por temas de optimización.
+
+# Ejecutamos el proceso de selección Stepwise BIC
+for (i in seq_len(R)) {
+  # Creamos los datos de prueba
+  X <- data.frame(matrix(rnorm(N * k), nrow = N, ncol = k))
+  X$y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+  
+  # Ajustamos un modelo auxiliar
+  modAux <- lm(y ~ ., data = X)
+  
+  # Realizamos la selección mediante stepwise BIC
+  mod <- stepAIC(modAux, 
+                 scope = list(lower = ~ 1, upper = y ~ .),
+                 trace = FALSE, 
+                 direction = "both",
+                 k = pen)
+  
+  # Obtenemos los coeficientes del modelo con lambda minima y los comparamos con los que deberían ser del true model
+  coeficientes <- names(coef(mod))
+  if ("X1" %in% coeficientes){
+    contadorX1_SB <- contadorX1_SB + 1
+  }
+  if ("X10" %in% coeficientes){
+    contadorX10_SB <- contadorX10_SB + 1
+  }
+  if ("X20" %in% coeficientes){
+    contadorX20_SB <- contadorX20_SB + 1
+  }
+}
+conteo_SB <- c(contadorX1_SB, contadorX10_SB, contadorX20_SB)
+```
+
+### d) Corrselect
+
+Este es un método desarrollado por el maestro Edwin Salim Tapia Alvarado que consiste en 
+
+### Resultados
+
+Tras realizar todos los métodos de selección de variables con los parámetros escogidos, estos fueron los resultados obtenidos:
+
+```{r Resultados caso 1, echo=FALSE}
+# Creamos un dataframe con todos los resultados
+tabla_resultados <- data.frame(
+  Modelo = c("Lasso", 
+             "Elastic Net",
+             "Stepwise AIC",
+             "Stepwise BIC",
+             "Corr Select"),
+  X1 = c(conteo_lasso[1], conteo_EN[1], conteo_SA[1], conteo_SB[1], NA),
+  X10 = c(conteo_lasso[2], conteo_EN[2], conteo_SA[2], conteo_SB[2], NA),
+  X20  = c(conteo_lasso[3], conteo_EN[3], conteo_SA[3], conteo_SB[3], NA)
+)
+
+# Los mostramos como una tabla html usando la función kable para que nos sea más sencillo generarla
+kable(tabla_resultados, 
+      caption = "Veces que se seleccionaron las variables del True Model en cada método", 
+      allign = "c")
+```
+
+Sin embargo, es importante mencionar que, si bien el método Stepwise AIC seleccionaba las variables que contenía el *True Model*, al correr pruebas unitarias era posible apreciar que el algoritmo seleccionaba más variables a parte de las previamente mencionadas. Esto no sucedía con el Stepwise BIC.
+
+## 2) Variaciones en la cantidad de variables y observaciones
+
+Ahora que habíamos probado el desempeño de los métodos de selección únicamente con repeticiones, decidimos cambiar el enfoque de estudio, aumentando entonces la cantidad de variables y observaciones en cada experimento.
+Para mantener rigurosidad y ver como iba alterandose la selección únicamente con aumento de datos pero no cambiando entre cada conjunto, se decidió fijar la semilla `123` para mantener constantes a los datos generados en iteraciones previas. Así, realizamos nuevamente cada uno de los procedimientos descritos anteriormente.
+En este caso, las variables utilizadas fueron las siguientes:
+
+```{r Variables caso 2}
+ks <- c(30, 40, 50, 80)
+Ns <- c(100, 250, 500)
+```
+
+### a) Lasso
+
+```{r Método Lasso 2, include=FALSE}
+# Creamos un dataframe para guardar nuestros resultados
+resultados_Lasso_2 <- data.frame(matrix(NA, 
+                                        nrow = length(Ns), 
+                                        ncol = length(ks)))
+rownames(resultados_Lasso_2) <- paste0("N=", Ns)
+colnames(resultados_Lasso_2) <- paste0("k=", ks)
+
+# Ejecutamos el proceso de selección Lasso
+for (i in seq_along(Ns)) {
+  for (j in seq_along(ks)) {
+    
+    # Extraemos los valores de los vectores
+    N <- Ns[i]
+    k <- ks[j]
+    
+    # Creamos los datos de prueba
+    set.seed(123)  # Para reproducibilidad
+    X <- matrix(rnorm(N * k), nrow = N, ncol = k)
+    colnames(X) <- paste0("X", 1:k) # Asignamos nombres a nuestras columnas
+    y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+    
+    # Afinamos el valor de lambda
+    mod <-  cv.glmnet(X, 
+                      y, 
+                      nfolds = 10, 
+                      type.measure = "mse", 
+                      gamma = 0, 
+                      relax = FALSE, 
+                      family = gaussian("identity"))
+    
+    # Obtenemos los coeficientes del modelo con lambda minima
+    coeficientes <- paste(get_nonzero_coefs(mod), collapse = ", ")
+    
+    # Guardamos en el dataframe
+    resultados_Lasso_2[i, j] <- coeficientes
+  }
+}
+```
+
+```{r Resultados Lasso 2, echo=FALSE}
+# Mostramos los resultados como una tabla html usando la función kable para que nos sea más sencillo generarla
+kable(resultados_Lasso_2, 
+      caption = "Variables seleccionadas en cada iteración", 
+      allign = "c")
+```
+
+### b) Elastic Net
+
+```{r Método Elastic Net 2, include=FALSE}
+# Creamos un dataframe para guardar nuestros resultados
+resultados_EN_2 <- data.frame(matrix(NA, 
+                                        nrow = length(Ns), 
+                                        ncol = length(ks)))
+rownames(resultados_EN_2) <- paste0("N=", Ns)
+colnames(resultados_EN_2) <- paste0("k=", ks)
+
+# Ejecutamos el proceso de selección Lasso
+for (i in seq_along(Ns)) {
+  for (j in seq_along(ks)) {
+    
+    # Extraemos los valores de los vectores
+    N <- Ns[i]
+    k <- ks[j]
+    
+    # Creamos los datos de prueba
+    set.seed(123)  # Para reproducibilidad
+    # Creamos los datos de prueba
+    X <- matrix(rnorm(N * k), nrow = N, ncol = k)
+    colnames(X) <- paste0("X", 1:k) # Asignamos nombres a nuestras columnas
+    y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+  
+    # Seleccionamos el método de remuestreo
+    Ajuste <- trainControl(method = "cv", 
+                         number = 5)
+  
+    # Creamos una malla para afinar a alpha y a lambda
+    tuneGrid <- expand.grid(alpha = seq(0, 1, by = 0.05), 
+                            lambda = 10^seq(-3, 0, length = 50))
+  
+    # Ajustamos el modelo y obtenemos las hiperparámetros afinados al mismo tiempo
+    model <- caret::train(
+      x = X, y = y,
+      method = "glmnet",
+      trControl = Ajuste,
+      metric = "RMSE",
+      tuneGrid = tuneGrid
+      )
+  
+    # Obtenemos los coeficientes del modelo con lambda minima
+    coeficientes <- paste(get_nonzero_coefs(model, EN = TRUE), 
+                          collapse = ", ")
+    
+    # Guardamos en el dataframe
+    resultados_EN_2[i, j] <- coeficientes
+  }
+}
+```
+
+```{r resultados Elastic Net 2, echo=FALSE}
+# Mostramos los resultados como una tabla html usando la función kable para que nos sea más sencillo generarla
+kable(resultados_EN_2, 
+      caption = "Variables seleccionadas en cada iteración", 
+      allign = "c")
+```
+
+### c) Stepwise
+
+#### Stepwise AIC
+
+```{r Método Step AIC 2, include=FALSE}
+# Creamos un dataframe para guardar nuestros resultados
+resultados_SA_2 <- data.frame(matrix(NA, 
+                                        nrow = length(Ns), 
+                                        ncol = length(ks)))
+rownames(resultados_SA_2) <- paste0("N=", Ns)
+colnames(resultados_SA_2) <- paste0("k=", ks)
+
+for (i in seq_along(Ns)) {
+  for (j in seq_along(ks)) {
+    
+    # Extraemos los valores de los vectores
+    N <- Ns[i]
+    k <- ks[j]
+    
+    # Creamos los datos de prueba
+    X <- data.frame(matrix(rnorm(N * k), nrow = N, ncol = k))
+    X$y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+    
+    # Ajustamos un modelo auxiliar
+    modAux <- lm(y ~ ., data = X)
+    
+    # Realizamos la selección mediante stepwise AIC
+    mod <- stepAIC(modAux, 
+                   scope = list(lower = ~ 1, upper = y ~ .),
+                   trace = FALSE, 
+                   direction = "both")
+    
+    # Obtenemos los coeficientes del modelo y los comparamos con los que deberían ser del true model
+    nombres_coef <- names(coef(mod))  # Nombres de los coeficientes
+    nombres_sin_intercept <- nombres_coef[nombres_coef != "(Intercept)"]
+    numeros <- as.numeric(gsub("X", "", nombres_sin_intercept))  # Convertir "X50" a 50, etc
+    nombres_ordenados <- nombres_sin_intercept[order(numeros)]
+    coeficientes <- paste(nombres_ordenados, collapse = ", ")
+    
+    # Guardamos en el dataframe
+    resultados_SA_2[i, j] <- coeficientes
+  }
+}
+```
+
+```{r Resultados Step AIC 2, echo=FALSE}
+# Mostramos los resultados como una tabla html usando la función kable para que nos sea más sencillo generarla
+kable(resultados_SA_2, 
+      caption = "Variables seleccionadas en cada iteración", 
+      allign = "c")
+```
+
+Es importante mencionar que cuando la cantidad de variables y de observaciones son iguales o muy similares, la función `stepAIC()` devuelve el siguiente error:
+
+`Error en stepAIC(modAux, scope = list(lower = ~1, upper = y ~ .), trace = FALSE, : AIC is -infinity for this model, so 'stepAIC' cannot proceed`
+
+Esto se debe a que existe un sobreajuste.
+  
+#### Stepwise BIC
+
+```{r Método Step BIC 2, include=FALSE}
+# Creamos un dataframe para guardar nuestros resultados
+resultados_SB_2 <- data.frame(matrix(NA, 
+                                        nrow = length(Ns), 
+                                        ncol = length(ks)))
+rownames(resultados_SB_2) <- paste0("N=", Ns)
+colnames(resultados_SB_2) <- paste0("k=", ks)
+
+for (i in seq_along(Ns)) {
+  for (j in seq_along(ks)) {
+    
+    # Extraemos los valores de los vectores
+    N <- Ns[i]
+    k <- ks[j]
+    
+    # Creamos los datos de prueba
+    X <- data.frame(matrix(rnorm(N * k), nrow = N, ncol = k))
+    X$y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + rnorm(N) # Variable de respuesta
+    
+    # Creamos la penalización con base en el número de filas
+    pen <- log(N)
+    
+    # Ajustamos un modelo auxiliar
+    modAux <- lm(y ~ ., data = X)
+    
+    # Realizamos la selección mediante stepwise AIC
+    mod <- stepAIC(modAux, 
+                   scope = list(lower = ~ 1, upper = y ~ .),
+                   trace = FALSE, 
+                   direction = "both",
+                   k = pen)
+    
+    # Obtenemos los coeficientes del modelo y los comparamos con los que deberían ser del true model
+    nombres_coef <- names(coef(mod))  # Nombres de los coeficientes
+    nombres_sin_intercept <- nombres_coef[nombres_coef != "(Intercept)"]
+    numeros <- as.numeric(gsub("X", "", nombres_sin_intercept))  # Convertir "X50" a 50, etc
+    nombres_ordenados <- nombres_sin_intercept[order(numeros)]
+    coeficientes <- paste(nombres_ordenados, collapse = ", ")
+    
+    # Guardamos en el dataframe
+    resultados_SB_2[i, j] <- coeficientes
+  }
+}
+```
+
+```{r Resultados Step BIC 2, echo=FALSE}
+# Mostramos los resultados como una tabla html usando la función kable para que nos sea más sencillo generarla
+kable(resultados_SB_2, 
+      caption = "Variables seleccionadas en cada iteración", 
+      allign = "c")
+```
+
+### Corrselect
+
+## 3) Fallas en los supuestos de un modelo de regresión lineal
+
+Al trabajar con un modelo de regresión lineal debemos verificar que sus supuestos se cumplan. Sin embargo, a menudo los datos con los que trabajamos no nos permiten validarlos de manera directa pues, debido a problemas inherentes a ellos, dichos supuestos no se cumplen en un primer lugar.
+Por lo que si estos problemas llegasen a existir en nuestros datos, ¿También crearían problemas que afectasen a los métodos de selección de variables?
+Con esa pregunta en mente nos dispusimos a probar distintas simulaciones donde los supuestos iban fallando.
+
+Las variables utilizadas fueron:
+
+```{r Variables caso 3}
+k <- 30
+N <- 500
+```
+
+### 1. Homocedasticidad
+
+Para este caso se simularon datos que fallaban el supuesto de homocedasticidad.
+
+Para conseguir esto se realizó el siguiente proceso de simulación, donde la perturbación $u$ que se muestra **no tiene varianza constante**:
+
+```{r Simulación de heterocedasticidad, results='hide'}
+# Creamos la matriz X con todos los datos
+X <- matrix(rnorm(N * k), nrow = N, ncol = k)
+
+# Para que la heterocedasticidad sea clara, hacemos que dependa de la primera variable
+x1 <- X[,1]  # extraemos la primera columna de X
+
+# Generamos la varianza como función de x1
+sigma2 <- 1.5 * x1^2
+
+# Simulamos los errores con varianza no constante
+u <- rnorm(N) * sqrt(sigma2)
+
+# Creamos la variable dependiente
+y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + u
+```
+
+Para verificar que efectivamente nuestra simulación es heterocedástica, podemos usar la prueba de Goldfel-Quant de la siguiente manera:
+
+```{r Prueba heterocedasticidad}
+# Ajustamos una regresión lineal de prueba
+m <- lm(y ~ X)
+
+# Corremos la prueba
+lmtest::gqtest(m)
+```
+
+### 2. Independencia
+
+En este punto buscamos crear algunas variables que estén correlacionadas entre sí. 
+Para ello partimos de dos variables progenitoras (`Dad` y `Mom`) que generarán la colinealidad que buscamos de la siguiente manera:
+
+```{r Simulación de colinealidad, results='hide'}
+# Indicamos la cantidad de variables que serán colineales
+k_colineal <- 6
+
+# Generamos las variables progenitoras
+Dad <- rnorm(N)
+Mom <- rnorm(N)
+
+# Creamos unos pesos 
+lambda <-  runif(k_colineal*2)
+
+# Creamos una matriz vacía para guardar las variables colineales
+z <- matrix(rep(0,N * k_colineal), nrow = N, ncol = k_colineal)
+
+# Rellenamos la matriz con los valores de las variables colineales
+for (i in seq_len(k_colineal)) {
+  j = 0
+  z[, i] <- lambda[i+j] + Mom + lambda[i + j + 1] + Dad + rnorm(N)
+  j = j + 1
+}
+
+# Creamos a las demás variables que no son colineales
+X <- matrix(rnorm(N * (k - k_colineal)), nrow = N, ncol = (k - k_colineal))
+
+# Creamos la variable de respuesta
+y <- X[,1]*18 + X[,10]*24 + X[,20]*20 + z[,1] + rnorm(N)
+
+# Unimos todos nuestros datos
+data <- cbind(y,X,z)
+
+# Asignamos nombres a nuestras columnas
+colnames(data) <- c("y", paste0("X", 1:(k-k_colineal)), paste0("Z", 1:k_colineal)) 
+```
+
+Para verificar que nuestra simulación efectivamente creó colinealidad, podemos generar el siguiente mapa de calor:
+
+```{r, Mapa de calor de la correlación, echo=FALSE}
+ggcorrplot::ggcorrplot(corr = cor(data),
+                       type = "lower", 
+                       show.diag = TRUE,
+                       lab = TRUE, 
+                       lab_size = 3)
+```
+
+Como podemos ver nuestra simulación fue correcta, teniendo además colinealidad en nuestras variables del **True Model**.
+
+## Referencias
+
+1. RPubs - Ridge, Lasso, and Elastic Net Tutorial. (s. f.). [https://rpubs.com/jmkelly91/881590](https://rpubs.com/jmkelly91/881590)
